@@ -22,6 +22,12 @@ import (
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
+const (
+	maxContainerMemory    = 512 * 1024 * 1024
+	maxContainerNanoCPUs  = 1_000_000_000
+	maxContainerProcesses = 128
+)
+
 func executeWithBackoff(ctx context.Context, log logr.Logger, operationName string, maxRetries int, baseDelay time.Duration, fn func() error) error {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		err := fn()
@@ -57,8 +63,9 @@ func executeWithBackoff(ctx context.Context, log logr.Logger, operationName stri
 
 func StartWorker(ctx context.Context, log logr.Logger, pool *repository.DbCall) {
 	amqpURL, ok := os.LookupEnv("RABBITMQ")
-	if !ok {
-		panic(fmt.Errorf("Cannot get RabbitMQ url"))
+	if !ok || amqpURL == "" {
+		log.Error(fmt.Errorf("RABBITMQ is not set"), "cannot start worker")
+		return
 	}
 
 	var conn *amqp.Connection
@@ -78,14 +85,16 @@ func StartWorker(ctx context.Context, log logr.Logger, pool *repository.DbCall) 
 
 	ch, err := conn.Channel()
 	if err != nil {
-		panic(fmt.Errorf("Failed to build queue channel: %w", err))
+		log.Error(err, "failed to build queue channel")
+		return
 	}
 	log.Info("Opened a channel")
 	defer ch.Close()
 
 	dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		panic(fmt.Errorf("Failed to initialize Docker client: %w", err))
+		log.Error(err, "failed to initialize Docker client")
+		return
 	}
 	defer dockerCli.Close()
 	log.Info("Connected to Docker Engine")
@@ -104,7 +113,8 @@ func StartWorker(ctx context.Context, log logr.Logger, pool *repository.DbCall) 
 		},
 	)
 	if err != nil {
-		panic(fmt.Errorf("Failed to declare consumer queue: %w", err))
+		log.Error(err, "failed to declare consumer queue")
+		return
 	}
 	log.Info("Declared a queue")
 
@@ -118,7 +128,8 @@ func StartWorker(ctx context.Context, log logr.Logger, pool *repository.DbCall) 
 		nil,
 	)
 	if err != nil {
-		panic(fmt.Errorf("Failed to register a consumer: %w", err))
+		log.Error(err, "failed to register a consumer")
+		return
 	}
 	log.Info("Registered a consumer")
 
@@ -127,12 +138,18 @@ func StartWorker(ctx context.Context, log logr.Logger, pool *repository.DbCall) 
 		case <-ctx.Done():
 			log.Info("Shutting down the worker")
 			return
-		case d := <-jobs:
+		case d, ok := <-jobs:
+			if !ok {
+				log.Error(fmt.Errorf("RabbitMQ delivery channel closed"), "stopping worker")
+				return
+			}
 			payload := d.Body
 			var task types.JobTask
 			if err := json.Unmarshal([]byte(payload), &task); err != nil {
 				log.Error(err, "[Worker] Invalid job payload, sending to DLQ")
-				_ = d.Nack(false, false) // requeue = false routes it to DLX
+				if nackErr := d.Nack(false, false); nackErr != nil {
+					log.Error(nackErr, "failed to reject invalid job payload")
+				}
 				continue
 			}
 
@@ -145,20 +162,40 @@ func StartWorker(ctx context.Context, log logr.Logger, pool *repository.DbCall) 
 			if err := pool.UpdateJobStatus(ctx, jobID, "running"); err != nil {
 				log.Error(err, fmt.Sprintf("failed to update job status. job: %s", task.Name))
 
-				_ = d.Nack(false, true)
+				if nackErr := d.Nack(false, true); nackErr != nil {
+					log.Error(nackErr, "failed to requeue job after status update failure", "job_name", task.Name)
+				}
 				continue
 			}
 
 			err = runDockerJob(ctx, dockerCli, task)
 			if err != nil {
 				log.Error(err, fmt.Sprintf("job execution failed: %s", task.Name))
-				_ = pool.UpdateJobStatus(ctx, jobID, "failed")
-				_ = d.Ack(false)
+				if ctx.Err() != nil {
+					if nackErr := d.Nack(false, true); nackErr != nil {
+						log.Error(nackErr, "failed to requeue interrupted job", "job_name", task.Name)
+					}
+					continue
+				}
+				if statusErr := pool.UpdateJobStatus(ctx, jobID, "failed"); statusErr != nil {
+					log.Error(statusErr, "failed to update job status to failed", "job_name", task.Name)
+					if nackErr := d.Nack(false, true); nackErr != nil {
+						log.Error(nackErr, "failed to requeue job after failed status update", "job_name", task.Name)
+					}
+					continue
+				}
+				if ackErr := d.Ack(false); ackErr != nil {
+					log.Error(ackErr, "failed to acknowledge failed job", "job_name", task.Name)
+				}
 				continue
 			}
 
 			if err := pool.UpdateJobStatus(ctx, jobID, "done"); err != nil {
 				log.Error(err, fmt.Sprintf("failed to update job status to done: %s", task.Name))
+				if nackErr := d.Nack(false, true); nackErr != nil {
+					log.Error(nackErr, "failed to requeue job after completion status update failure", "job_name", task.Name)
+				}
+				continue
 			}
 
 			if err := d.Ack(false); err != nil {
@@ -217,12 +254,20 @@ func runDockerJob(ctx context.Context, cli *client.Client, task types.JobTask) e
 		workDir = "/" + workDir
 	}
 
+	processLimit := int64(maxContainerProcesses)
 	resp, err := cli.ContainerCreate(jobCtx, &container.Config{
 		Image:      imageName,
 		Cmd:        dockerCmd,
 		Env:        envs,
 		WorkingDir: workDir,
-	}, nil, nil, nil, "")
+	}, &container.HostConfig{
+		Resources: container.Resources{
+			Memory:     maxContainerMemory,
+			MemorySwap: maxContainerMemory,
+			NanoCPUs:   maxContainerNanoCPUs,
+			PidsLimit:  &processLimit,
+		},
+	}, nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("failed to create container: %w", err)
 	}
@@ -249,11 +294,17 @@ func runDockerJob(ctx context.Context, cli *client.Client, task types.JobTask) e
 
 	statusCh, errCh := cli.ContainerWait(jobCtx, resp.ID, container.WaitConditionNotRunning)
 	select {
-	case err := <-errCh:
+	case err, ok := <-errCh:
+		if !ok {
+			return fmt.Errorf("container wait error channel closed unexpectedly")
+		}
 		if err != nil {
 			return fmt.Errorf("container wait error: %w", err)
 		}
-	case status := <-statusCh:
+	case status, ok := <-statusCh:
+		if !ok {
+			return fmt.Errorf("container status channel closed unexpectedly")
+		}
 		if status.StatusCode != 0 {
 			return fmt.Errorf("container exited with non-zero status: %d", status.StatusCode)
 		}

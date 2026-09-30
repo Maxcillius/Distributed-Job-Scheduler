@@ -12,7 +12,7 @@ import (
 
 func NewConnection(ctx context.Context) (*DbCall, error) {
 	dbUrl, ok := os.LookupEnv("DATABASE_URL")
-	if !ok {
+	if !ok || dbUrl == "" {
 		return nil, fmt.Errorf("invalid DATABASE_URL")
 	}
 
@@ -23,6 +23,7 @@ func NewConnection(ctx context.Context) (*DbCall, error) {
 
 	err = dbConn.Ping(ctx)
 	if err != nil {
+		dbConn.Close()
 		return nil, fmt.Errorf("error pinging datbase: %w", err)
 	}
 

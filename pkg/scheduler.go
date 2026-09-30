@@ -58,8 +58,9 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 	log.Info("Reconcile trigger received. Scheduling jobs...")
 
 	amqpURL, ok := os.LookupEnv("RABBITMQ")
-	if !ok {
-		panic(fmt.Errorf("cannot get RabbitMQ url"))
+	if !ok || amqpURL == "" {
+		reportError(ctx, errChan, fmt.Errorf("RABBITMQ is not set"))
+		return
 	}
 
 	var conn *amqp.Connection
@@ -71,7 +72,7 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 	})
 
 	if err != nil {
-		errChan <- fmt.Errorf("failed to connect to RabbitMQ: %w", err)
+		reportError(ctx, errChan, fmt.Errorf("failed to connect to RabbitMQ: %w", err))
 		return
 	}
 	defer conn.Close()
@@ -79,7 +80,7 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 
 	ch, err := conn.Channel()
 	if err != nil {
-		errChan <- fmt.Errorf("failed to open a channel: %w", err)
+		reportError(ctx, errChan, fmt.Errorf("failed to open a channel: %w", err))
 		return
 	}
 	defer ch.Close()
@@ -95,7 +96,8 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 		nil,
 	)
 	if err != nil {
-		panic(fmt.Errorf("Failed to declare DLX: %w", err)) // Use errChan <- err in scheduler
+		reportError(ctx, errChan, fmt.Errorf("failed to declare dead-letter exchange: %w", err))
+		return
 	}
 	log.Info("Declared Dead Letter Exchange")
 
@@ -110,7 +112,8 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 		},
 	)
 	if err != nil {
-		panic(fmt.Errorf("Failed to declare DLQ: %w", err))
+		reportError(ctx, errChan, fmt.Errorf("failed to declare dead-letter queue: %w", err))
+		return
 	}
 	log.Info("Declared Dead Letter Queue")
 
@@ -123,7 +126,8 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 		nil,
 	)
 	if err != nil {
-		panic(fmt.Errorf("Failed to bind DLQ: %w", err))
+		reportError(ctx, errChan, fmt.Errorf("failed to bind dead-letter queue: %w", err))
+		return
 	}
 
 	q, err := ch.QueueDeclare(
@@ -140,7 +144,8 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 		},
 	)
 	if err != nil {
-		panic(fmt.Errorf("Failed to declare main jobs queue: %w", err))
+		reportError(ctx, errChan, fmt.Errorf("failed to declare main jobs queue: %w", err))
+		return
 	}
 	log.Info("Declared main jobs queue with DLX routing")
 
@@ -153,7 +158,7 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 
 			entries, err := os.ReadDir("./Jobs")
 			if err != nil {
-				errChan <- fmt.Errorf("failed to read jobs dir: %w", err)
+				reportError(ctx, errChan, fmt.Errorf("failed to read jobs dir: %w", err))
 				continue
 			}
 
@@ -161,7 +166,7 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 				if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".yml") {
 					task, err := parseJobFile(entry.Name())
 					if err != nil {
-						errChan <- fmt.Errorf("failed to parse job file: %w", err)
+						reportError(ctx, errChan, fmt.Errorf("failed to parse job file %s: %w", entry.Name(), err))
 						continue
 					}
 
@@ -180,7 +185,7 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 
 					data, err := json.Marshal(task)
 					if err != nil {
-						errChan <- fmt.Errorf("failed to marshal the data of %s: %w", task.Name, err)
+						reportError(ctx, errChan, fmt.Errorf("failed to marshal the data of %s: %w", task.Name, err))
 						continue
 					}
 
@@ -189,8 +194,8 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 						Name:           task.Name,
 						Command:        task.Command,
 						Args:           task.Args,
-						Workdir:        pgtype.Text{task.WorkDir, true},
-						Timeoutseconds: pgtype.Int4{int32(task.TimeoutSeconds), true},
+						Workdir:        pgtype.Text{String: task.WorkDir, Valid: true},
+						Timeoutseconds: pgtype.Int4{Int32: int32(task.TimeoutSeconds), Valid: true},
 						Status:         "waiting",
 					}
 
@@ -198,7 +203,7 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 					if err != nil {
 						log.Error(err, fmt.Sprintf("failed to insert in database %s", task.Name))
 						// logging error at scheduler level
-						errChan <- fmt.Errorf("failed to insert job in database %s: %w", task.Name, err)
+						reportError(ctx, errChan, fmt.Errorf("failed to insert job in database %s: %w", task.Name, err))
 						continue
 						// Avoid pushing jobs into queue if failed to insert into the database
 					}
@@ -209,7 +214,7 @@ func Scheduler(ctx context.Context, log logr.Logger, trigChan <-chan struct{}, e
 							Body:        []byte(data),
 						}); err != nil {
 						log.Error(err, "failed to schedule job", "job_name", task.Name)
-						errChan <- fmt.Errorf("failed to schedule job %s: %w", task.Name, err)
+						reportError(ctx, errChan, fmt.Errorf("failed to schedule job %s: %w", task.Name, err))
 						continue
 					}
 					log.Info("Dispatched job", "job_name", task.Name)
